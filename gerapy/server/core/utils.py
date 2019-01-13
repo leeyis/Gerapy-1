@@ -1,11 +1,19 @@
 import fnmatch
 import re
-import os
-import traceback
-from os.path import join, abspath, dirname
+from copy import deepcopy
+from furl import furl
+from subprocess import Popen, PIPE, STDOUT
+from os.path import abspath
 from shutil import ignore_patterns, copy2, copystat
 from jinja2 import Template
 from scrapyd_api import ScrapydAPI
+from bs4 import BeautifulSoup
+import traceback
+import json, os, string
+from shutil import move, copy, rmtree
+from os.path import join, exists, dirname
+from django.utils import timezone
+from gerapy.server.server.settings import PROJECTS_FOLDER
 
 IGNORES = ['.git/', '*.pyc', '.DS_Store', '.idea/', '*.egg', '*.egg-info/', '*.egg-info', 'build/']
 
@@ -18,6 +26,9 @@ TEMPLATES_TO_RENDER = (
     ('${project_name}', 'pipelines.py.tmpl'),
     ('${project_name}', 'middlewares.py.tmpl'),
 )
+
+NO_REFERRER = '<meta name="referrer" content="never">'
+BASE = '<base href="{href}">'
 
 
 def get_scrapyd(client):
@@ -143,12 +154,12 @@ def render_template(tpl_file, dst_file, *args, **kwargs):
     :return: None
     """
     vars = dict(*args, **kwargs)
-    template = Template(open(tpl_file).read())
+    template = Template(open(tpl_file, encoding='utf-8').read())
     os.remove(tpl_file)
     result = template.render(vars)
-    print(result)
+    #print(result)
     
-    open(dst_file, 'w').write(result)
+    open(dst_file, 'w', encoding='utf-8').write(result)
 
 
 def get_traceback():
@@ -164,3 +175,282 @@ def get_traceback():
             return info[-1]
         return None
     return info
+
+
+def process_request(request):
+    """
+    process request
+    :param request:
+    :return:
+    """
+    return {
+        'url': request.url,
+        'method': request.method,
+        'meta': request.meta,
+        'headers': request.headers,
+        'callback': request.callback
+    }
+
+
+def process_response(response):
+    """
+    process response to dict
+    :param response:
+    :return:
+    """
+    return {
+        'html': process_html(response.text, furl(response.url).origin),
+        'url': response.url,
+        'status': response.status
+    }
+
+
+def process_item(item):
+    return dict(item)
+
+
+def process_html(html, base_url):
+    """
+    process html, add some tricks such as no referrer
+    :param html: source html
+    :return: processed html
+    """
+    dom = BeautifulSoup(html, 'lxml')
+    dom.find('head').insert(0, BeautifulSoup(NO_REFERRER, 'lxml'))
+    dom.find('head').insert(0, BeautifulSoup(BASE.format(href=base_url), 'lxml'))
+    html = str(dom)
+    # html = unescape(html)
+    return html
+
+
+def get_output_error(project_name, spider_name):
+    """
+    get scrapy runtime error
+    :param project_name: project name
+    :param spider_name: spider name
+    :return: output, error
+    """
+    work_cwd = os.getcwd()
+    project_path = join(PROJECTS_FOLDER, project_name)
+    try:
+        os.chdir(project_path)
+        cmd = ' '.join(['scrapy', 'crawl', spider_name])
+        p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT, close_fds=True)
+        output = p.stdout.read()
+        if isinstance(output, bytes):
+            output = output.decode('utf-8')
+        return output
+    finally:
+        os.chdir(work_cwd)
+
+
+def get_items_configuration(configuration):
+    """
+    get items configuration including allowed_spiders and tables or collections
+    :param configuration: configuration data
+    :return: items
+    """
+    configuration = deepcopy(configuration)
+    items = configuration.get('items')
+    spiders = configuration.get('spiders')
+    for spider in spiders:
+        # MongoDB
+        mongodb_collection_map = spider.get('storage').get('mongodb').get('collections')
+        for mongodb_collection_map_item in mongodb_collection_map:
+            collection = mongodb_collection_map_item.get('collection')
+            item_name = mongodb_collection_map_item.get('item')
+            for item in items:
+                if item.get('name') == item_name:
+                    allowed_spiders = item.get('mongodb_spiders', set())
+                    allowed_spiders.add(spider.get('name'))
+                    mongodb_collections = item.get('mongodb_collections', set())
+                    mongodb_collections.add(collection)
+                    item['mongodb_spiders'], item['mongodb_collections'] = allowed_spiders, mongodb_collections
+        
+        # MySQL
+        mysql_table_map = spider.get('storage').get('mysql').get('tables')
+        for mysql_table_map_item in mysql_table_map:
+            collection = mysql_table_map_item.get('table')
+            item_name = mysql_table_map_item.get('item')
+            for item in items:
+                if item.get('name') == item_name:
+                    allowed_spiders = item.get('mysql_spiders', set())
+                    allowed_spiders.add(spider.get('name'))
+                    mysql_tables = item.get('mysql_tables', set())
+                    mysql_tables.add(collection)
+                    item['mysql_spiders'], item['mysql_tables'] = allowed_spiders, mysql_tables
+    # transfer attr
+    attrs = ['mongodb_spiders', 'mongodb_collections', 'mysql_spiders', 'mysql_tables']
+    for item in items:
+        for attr in attrs:
+            if item.get(attr):
+                item[attr] = list(item[attr])
+    return items
+
+def process_custom_settings(spider):
+    """
+    process custom settings of some config items
+    :param spider:
+    :return:
+    """
+    custom_settings = spider.get('custom_settings')
+    def add_dict_to_custom_settings(custom_settings, keys):
+        """
+        if config doesn't exist, add default value
+        :param custom_settings:
+        :param keys:
+        :return:
+        """
+        for key in keys:
+            for item in custom_settings:
+                if item['key'] == key:
+                    break
+            else:
+                custom_settings.append({
+                    'key': key,
+                    'value': '{}'
+                })
+        return custom_settings
+    
+    keys = ['DOWNLOADER_MIDDLEWARES', 'SPIDER_MIDDLEWARES', 'ITEM_PIPELINES']
+    custom_settings = add_dict_to_custom_settings(custom_settings, keys)
+    for item in custom_settings:
+        
+        if item['key'] == 'DOWNLOADER_MIDDLEWARES':
+            item_data = json.loads(item['value'])
+            if spider.get('cookies', {}).get('enable', {}): item_data['gerapy.downloadermiddlewares.cookies.CookiesMiddleware'] = 554
+            if spider.get('proxy', {}).get('enable', {}): item_data['gerapy.downloadermiddlewares.proxy.ProxyMiddleware'] = 555
+            item_data['gerapy.downloadermiddlewares.pyppeteer.PyppeteerMiddleware'] = 601
+            item_data['scrapy_splash.SplashCookiesMiddleware'] = 723
+            item_data['scrapy_splash.SplashMiddleware'] = 725
+            item_data['scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware'] = 810
+            item['value'] = json.dumps(item_data)
+        if item['key'] == 'SPIDER_MIDDLEWARES':
+            item_data = json.loads(item['value'])
+            item_data['scrapy_splash.SplashDeduplicateArgsMiddleware'] = 100
+            item['value'] = json.dumps(item_data)
+        if item['key'] == 'ITEM_PIPELINES':
+            item_data = json.loads(item['value'])
+            if spider.get('storage', {}).get('mysql', {}).get('enable', {}): item_data['gerapy.pipelines.MySQLPipeline'] = 300
+            if spider.get('storage', {}).get('mongodb', {}).get('enable', {}): item_data['gerapy.pipelines.MongoDBPipeline'] = 301
+            item['value'] = json.dumps(item_data)
+    return spider
+
+
+def generate_project(project_name):
+    """
+    generate project code
+    :param project_name: project name
+    :return: project data
+    """
+    # get configuration
+    from gerapy.server.core.models import Project
+    configuration = Project.objects.get(name=project_name).configuration
+    configuration = json.loads(configuration)
+    # remove original project dir
+    project_dir = join(PROJECTS_FOLDER, project_name)
+    if exists(project_dir):
+        rmtree(project_dir)
+    # generate project
+    copy_tree(join(TEMPLATES_DIR, 'project'), project_dir)
+    move(join(PROJECTS_FOLDER, project_name, 'module'), join(project_dir, project_name))
+    for paths in TEMPLATES_TO_RENDER:
+        path = join(*paths)
+        tplfile = join(project_dir,
+                       string.Template(path).substitute(project_name=project_name))
+        items = get_items_configuration(configuration)
+        vars = {
+            'project_name': project_name,
+            'items': items,
+        }
+        render_template(tplfile, tplfile.rstrip('.tmpl'), **vars)
+    # generate spider
+    spiders = configuration.get('spiders')
+    for spider in spiders:
+        spider = process_custom_settings(spider)
+        source_tpl_file = join(TEMPLATES_DIR, 'spiders', 'crawl.tmpl')
+        new_tpl_file = join(PROJECTS_FOLDER, project_name, project_name, 'spiders', 'crawl.tmpl')
+        spider_file = "%s.py" % join(PROJECTS_FOLDER, project_name, project_name, 'spiders', spider.get('name'))
+        copy(source_tpl_file, new_tpl_file)
+        render_template(new_tpl_file, spider_file, spider=spider, project_name=project_name)
+    # save generated_at attr
+    model = Project.objects.get(name=project_name)
+    model.generated_at = timezone.now()
+    # clear built_at attr
+    model.built_at = None
+    model.save()
+
+
+def bytes2str(data):
+    """
+    bytes2str
+    :param data: origin data
+    :return: str
+    """
+    if isinstance(data, bytes):
+        data = data.decode('utf-8')
+    data = data.strip()
+    return data
+
+
+def clients_of_task(task):
+    """
+    get valid clients of task
+    :param task: task object
+    :return:
+    """
+    from gerapy.server.core.models import Client
+    client_ids = json.loads(task.clients)
+    for client_id in client_ids:
+        client = Client.objects.get(id=client_id)
+        if client:
+            yield client
+
+
+def get_job_id(client, task):
+    """
+    construct job id
+    :param client: client object
+    :param task: task object
+    :return: job id
+    """
+    return '%s-%s-%s' % (client.id, task.project, task.spider)
+
+
+def load_dict(x, transformer=None):
+    """
+    convert to  dict
+    :param x:
+    :return:
+    """
+    if x is None or isinstance(x, dict):
+        return x
+    try:
+        data = json.loads(x)
+        if not transformer:
+            transformer = lambda x: x
+        data = {k: transformer(v) for k, v in data.items()}
+        return data
+    except:
+        return {}
+
+
+def load_list(x, transformer=None):
+    """
+    convert to list
+    :param x:
+    :return:
+    """
+    if x is None or isinstance(x, list):
+        return x
+    try:
+        data = json.loads(x)
+        if not transformer:
+            transformer = lambda x: x
+        print('Data', data)
+        data = list(map(lambda x: transformer(x), data))
+        print('Transfoermer', transformer)
+        print('Data', data)
+        return data
+    except:
+        return []

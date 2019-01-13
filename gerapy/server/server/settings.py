@@ -48,7 +48,7 @@ MIDDLEWARE = [
     'gerapy.server.core.middlewares.TransformMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
-    'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    # 'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
 ROOT_URLCONF = 'gerapy.server.server.urls'
@@ -124,6 +124,12 @@ CORS_ORIGIN_ALLOW_ALL = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/1.10/howto/static-files/
 
+X_FRAME_OPTIONS = 'SAMEORIGIN'
+
 STATICFILES_DIRS = (
     os.path.join(BASE_DIR, 'core/templates/static'),
 )
+
+PROJECTS_FOLDER = 'projects'
+
+SCHEDULER_HEARTBEAT = 5

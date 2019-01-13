@@ -11,8 +11,11 @@ class Client(Model):
     auth = IntegerField(default=0, blank=True, null=True)
     username = CharField(max_length=255, blank=True, null=True)
     password = CharField(max_length=255, blank=True, null=True)
-    created_at = DateTimeField(auto_now_add=True)
-    updated_at = DateTimeField(auto_now=True)
+    created_at = DateTimeField(auto_now_add=True, blank=True, null=True)
+    updated_at = DateTimeField(auto_now=True, blank=True, null=True)
+    
+    def __str__(self):
+        return self.name
 
 
 class Project(Model):
@@ -23,9 +26,12 @@ class Project(Model):
     configurable = IntegerField(default=0, blank=True)
     built_at = DateTimeField(default=None, blank=True, null=True)
     generated_at = DateTimeField(default=None, blank=True, null=True)
-    created_at = DateTimeField(auto_now_add=True)
-    updated_at = DateTimeField(auto_now=True)
+    created_at = DateTimeField(auto_now_add=True, blank=True, null=True)
+    updated_at = DateTimeField(auto_now=True, blank=True, null=True)
     clients = ManyToManyField(Client, through='Deploy', unique=False)
+    
+    def __str__(self):
+        return self.name
 
 
 class Deploy(Model):
@@ -33,8 +39,8 @@ class Deploy(Model):
     project = ForeignKey(Project, unique=False, on_delete=DO_NOTHING)
     description = CharField(max_length=255, blank=True, null=True)
     deployed_at = DateTimeField(default=None, blank=True, null=True)
-    created_at = DateTimeField(auto_now_add=True)
-    updated_at = DateTimeField(auto_now=True)
+    created_at = DateTimeField(auto_now_add=True, blank=True, null=True)
+    updated_at = DateTimeField(auto_now=True, blank=True, null=True)
     
     class Meta:
         unique_together = ('client', 'project')
@@ -42,22 +48,26 @@ class Deploy(Model):
 
 class Monitor(Model):
     name = CharField(max_length=255, default=None)
-    description = CharField(max_length=255, default='', blank=True)
-    type = CharField(max_length=255, default='', blank=True)
-    configuration = TextField(default='', blank=True)
+    description = CharField(max_length=255, null=True, blank=True)
+    type = CharField(max_length=255, null=True, blank=True)
+    configuration = TextField(null=True, blank=True)
     project = ForeignKey(Project, blank=True, null=True, on_delete=DO_NOTHING)
-    created_at = DateTimeField(auto_now_add=True)
-    updated_at = DateTimeField(auto_now=True)
+    created_at = DateTimeField(auto_now_add=True, blank=True, null=True)
+    updated_at = DateTimeField(auto_now=True, blank=True, null=True)
 
 
 class Task(Model):
-    client = ForeignKey(Client, unique=False, on_delete=DO_NOTHING)
-    project = CharField(max_length=255, default='', blank=True)
-    spider = CharField(max_length=255, default='', blank=True)
-    args = TextField(default='', blank=True)
-    configuration = TextField(default='', blank=True)
-    success = IntegerField(default=0, blank=True)
-    error = IntegerField(default=0, blank=True)
-    last = DateTimeField(auto_now=True)
-    created_at = DateTimeField(auto_now_add=True)
-    updated_at = DateTimeField(auto_now=True)
+    clients = TextField(null=True, blank=True)
+    project = CharField(max_length=255, null=True, blank=True)
+    spider = CharField(max_length=255, null=True, blank=True)
+    name = CharField(max_length=255, null=True, blank=True)
+    args = TextField(null=True, blank=True)
+    description = TextField(null=True, blank=True)
+    trigger = CharField(max_length=255, null=True, blank=True)
+    configuration = TextField(null=True, blank=True)
+    modified = BooleanField(blank=True, default=False)
+    created_at = DateTimeField(auto_now_add=True, blank=True, null=True)
+    updated_at = DateTimeField(auto_now=True, blank=True, null=True)
+    
+    def __str__(self):
+        return self.name

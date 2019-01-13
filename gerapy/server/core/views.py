@@ -1,21 +1,24 @@
-import sys
-import traceback
-import json, os, requests, time, pytz, pymongo, string
-from shutil import move, copy, rmtree
+from urllib.parse import unquote
+import base64
+import json, os, requests, time, pytz, pymongo
+from shutil import rmtree
 from requests.exceptions import ConnectionError
-from os.path import join, exists
+from os.path import join, exists, dirname
 from django.shortcuts import render
 from django.core.serializers import serialize
 from django.http import HttpResponse
 from django.forms.models import model_to_dict
 from django.utils import timezone
+from subprocess import Popen, PIPE
 from gerapy.server.core.response import JsonResponse
 from gerapy.cmd.init import PROJECTS_FOLDER
 from gerapy.server.server.settings import TIME_ZONE
 from gerapy.server.core.models import Client, Project, Deploy, Monitor, Task
 from gerapy.server.core.build import build_project, find_egg
 from gerapy.server.core.utils import IGNORES, is_valid_name, copy_tree, TEMPLATES_DIR, TEMPLATES_TO_RENDER, \
-    render_template, get_traceback, scrapyd_url, log_url, get_tree, get_scrapyd
+    render_template, get_traceback, scrapyd_url, log_url, get_tree, get_scrapyd, process_html, generate_project, \
+    get_output_error, bytes2str, clients_of_task, get_job_id
+from django_apscheduler.models import DjangoJob, DjangoJobExecution
 
 
 def index(request):
@@ -130,8 +133,6 @@ def client_remove(request, client_id):
         client = Client.objects.get(id=client_id)
         # delete deploy
         Deploy.objects.filter(client=client).delete()
-        # delete task
-        Task.objects.filter(client_id=client_id).delete()
         # delete client
         Client.objects.filter(id=client_id).delete()
         return JsonResponse({'result': '1'})
@@ -210,7 +211,7 @@ def project_index(request):
 
 def project_configure(request, project_name):
     """
-    get or update configuration
+    get configuration
     :param request: request object
     :param project_name: project name
     :return: json
@@ -227,9 +228,15 @@ def project_configure(request, project_name):
         data = json.loads(request.body)
         configuration = json.dumps(data.get('configuration'))
         project.update(**{'configuration': configuration})
-        project = Project.objects.get(name=project_name)
-        project = model_to_dict(project)
-        return JsonResponse(project)
+        # execute generate cmd
+        cmd = ' '.join(['gerapy', 'generate', project_name])
+        p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=PIPE)
+        stdout, stderr = bytes2str(p.stdout.read()), bytes2str(p.stderr.read())
+        
+        if not stderr:
+            return JsonResponse({'status': '1'})
+        else:
+            return JsonResponse({'status': '0', 'message': stderr})
 
 
 def project_tree(request, project_name):
@@ -275,8 +282,6 @@ def project_remove(request, project_name):
         Deploy.objects.filter(project=project).delete()
         # delete project
         result = Project.objects.filter(name=project_name).delete()
-        # delete scheduler
-        Task.objects.filter(project_name=project).delete()
         # get project path
         path = join(os.path.abspath(os.getcwd()), PROJECTS_FOLDER)
         project_path = join(path, project_name)
@@ -340,16 +345,13 @@ def project_deploy(request, client_id, project_name):
         project = Project.objects.get(name=project_name)
         # execute deploy operation
         scrapyd = get_scrapyd(client)
-        try:
-            scrapyd.add_version(project_name, int(time.time()), egg_file.read())
-            # update deploy info
-            deployed_at = timezone.now()
-            Deploy.objects.filter(client=client, project=project).delete()
-            deploy, result = Deploy.objects.update_or_create(client=client, project=project, deployed_at=deployed_at,
-                                                             description=project.description)
-            return JsonResponse(model_to_dict(deploy))
-        except Exception:
-            return JsonResponse({'message': get_traceback()}, status=500)
+        scrapyd.add_version(project_name, int(time.time()), egg_file.read())
+        # update deploy info
+        deployed_at = timezone.now()
+        Deploy.objects.filter(client=client, project=project).delete()
+        deploy, result = Deploy.objects.update_or_create(client=client, project=project, deployed_at=deployed_at,
+                                                         description=project.description)
+        return JsonResponse(model_to_dict(deploy))
 
 
 def project_build(request, project_name):
@@ -411,53 +413,46 @@ def project_build(request, project_name):
         return JsonResponse(data)
 
 
-def project_generate(request, project_name):
+def project_parse(request, project_name):
     """
-    generate code of project
+    parse project
     :param request: request object
     :param project_name: project name
-    :return: json of generated project
+    :return: requests, items, response
     """
     if request.method == 'POST':
-        # get configuration
-        configuration = Project.objects.get(name=project_name).configuration
-        if not configuration:
-            return JsonResponse({'message': 'Invalid configuration'}, status=500)
-        configuration = json.loads(configuration)
-        if not is_valid_name(project_name):
-            return JsonResponse({'message': 'Invalid project name'}, status=500)
-        # remove original project dir
-        project_dir = join(PROJECTS_FOLDER, project_name)
-        if exists(project_dir):
-            rmtree(project_dir)
-        # generate project
-        copy_tree(join(TEMPLATES_DIR, 'project'), project_dir)
-        move(join(PROJECTS_FOLDER, project_name, 'module'), join(project_dir, project_name))
-        for paths in TEMPLATES_TO_RENDER:
-            path = join(*paths)
-            tplfile = join(project_dir,
-                           string.Template(path).substitute(project_name=project_name))
-            vars = {
-                'project_name': project_name,
-                'items': configuration.get('items'),
-            }
-            render_template(tplfile, tplfile.rstrip('.tmpl'), **vars)
-        # generate spider
-        spiders = configuration.get('spiders')
-        for spider in spiders:
-            source_tpl_file = join(TEMPLATES_DIR, 'spiders', 'crawl.tmpl')
-            new_tpl_file = join(PROJECTS_FOLDER, project_name, project_name, 'spiders', 'crawl.tmpl')
-            spider_file = "%s.py" % join(PROJECTS_FOLDER, project_name, project_name, 'spiders', spider.get('name'))
-            copy(source_tpl_file, new_tpl_file)
-            render_template(new_tpl_file, spider_file, spider=spider, project_name=project_name)
-        # save generated_at attr
-        model = Project.objects.get(name=project_name)
-        model.generated_at = timezone.now()
-        # clear built_at attr
-        model.built_at = None
-        model.save()
-        # return model
-        return JsonResponse(model_to_dict(model))
+        print(project_name)
+        project_path = join(PROJECTS_FOLDER, project_name)
+        print('Project Path', project_path)
+        data = json.loads(request.body)
+        spider_name = data.get('spider')
+        # start = data.get('start', 0)
+        # method = data.get('method', 'GET')
+        # headers = data.get('headers', {})
+        # meta = data.get('meta', {})
+        # url = data.get('url')
+        # callback = data.get('callback')
+        # construct args cmd
+        args = {
+            'start': data.get('start', 0),
+            'method': data.get('method', 'GET'),
+            'url': data.get('url'),
+            'callback': data.get('callback')
+        }
+        # args = ['start', 'method', 'url', 'callback']
+        args_cmd = ' '.join(
+            ['--{arg} {value}'.format(arg=arg, value=value) if value else '' for arg, value in args.items()])
+        cmd = 'gerapy parse {args_cmd} {project_path} {spider_name}'.format(
+            args_cmd=args_cmd,
+            project_path=project_path,
+            spider_name=spider_name
+        )
+        p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=PIPE, close_fds=True)
+        stdout, stderr = bytes2str(p.stdout.read()), bytes2str(p.stderr.read())
+        if not stderr:
+            return JsonResponse({'status': '1', 'result': json.loads(stdout)})
+        else:
+            return JsonResponse({'status': '0', 'message': stderr})
 
 
 def project_file_read(request):
@@ -469,8 +464,9 @@ def project_file_read(request):
     if request.method == 'POST':
         data = json.loads(request.body)
         path = join(data['path'], data['label'])
-        with open(path, 'r') as f:
-            return HttpResponse(f.read())
+        # binary file
+        with open(path, 'rb') as f:
+            return HttpResponse(f.read().decode('utf-8'))
 
 
 def project_file_update(request):
@@ -483,7 +479,7 @@ def project_file_update(request):
         data = json.loads(request.body)
         path = join(data['path'], data['label'])
         code = data['code']
-        with open(path, 'w') as f:
+        with open(path, 'w', encoding='utf-8') as f:
             f.write(code)
             return JsonResponse({'result': '1'})
 
@@ -497,7 +493,7 @@ def project_file_create(request):
     if request.method == 'POST':
         data = json.loads(request.body)
         path = join(data['path'], data['name'])
-        open(path, 'w').close()
+        open(path, 'w', encoding='utf-8').close()
         return JsonResponse({'result': '1'})
 
 
@@ -602,6 +598,28 @@ def job_cancel(request, client_id, project_name, job_id):
             return JsonResponse({'message': 'Connect Error'})
 
 
+def del_version(request, client_id, project, version):
+    if request.method == 'GET':
+        client = Client.objects.get(id=client_id)
+        try:
+            scrapyd = get_scrapyd(client)
+            result = scrapyd.delete_version(project=project, version=version)
+            return JsonResponse(result)
+        except ConnectionError:
+            return JsonResponse({'message': 'Connect Error'})
+
+
+def del_project(request, client_id, project):
+    if request.method == 'GET':
+        client = Client.objects.get(id=client_id)
+        try:
+            scrapyd = get_scrapyd(client)
+            result = scrapyd.delete_project(project=project)
+            return JsonResponse(result)
+        except ConnectionError:
+            return JsonResponse({'message': 'Connect Error'})
+
+
 def monitor_db_list(request):
     """
     get monitor db list
@@ -658,16 +676,31 @@ def task_create(request):
     """
     if request.method == 'POST':
         data = json.loads(request.body)
-        try:
-            client = Client.objects.get(id=data.get('client'))
-            task = Task.objects.create(client=client,
-                                       project=data.get('project'),
-                                       spider=data.get('spider'),
-                                       configuration=json.dumps(data.get('configuration')))
-            return JsonResponse({'result': '1', 'data': model_to_dict(task)})
-        except:
-            traceback.print_exc(file=sys.stdout)
-            return JsonResponse({'result': '0'})
+        task = Task.objects.create(clients=json.dumps(data.get('clients')),
+                                   project=data.get('project'),
+                                   name=data.get('name'),
+                                   spider=data.get('spider'),
+                                   trigger=data.get('trigger'),
+                                   configuration=json.dumps(data.get('configuration')),
+                                   modified=1)
+        return JsonResponse({'result': '1', 'data': model_to_dict(task)})
+
+
+def task_update(request, task_id):
+    """
+    update task info
+    :param request: request object
+    :param task_id: task id
+    :return: json
+    """
+    if request.method == 'POST':
+        task = Task.objects.filter(id=task_id)
+        data = json.loads(request.body)
+        data['clients'] = json.dumps(data.get('clients'))
+        data['configuration'] = json.dumps(data.get('configuration'))
+        data['modified'] = 1
+        task.update(**data)
+        return JsonResponse(model_to_dict(Task.objects.get(id=task_id)))
 
 
 def task_remove(request, task_id):
@@ -684,6 +717,21 @@ def task_remove(request, task_id):
             return JsonResponse({'result': '0'})
 
 
+def task_info(request, task_id):
+    """
+    get task info
+    :param request: request object
+    :param task_id: task id
+    :return: json
+    """
+    if request.method == 'GET':
+        task = Task.objects.get(id=task_id)
+        data = model_to_dict(task)
+        data['clients'] = json.loads(data.get('clients'))
+        data['configuration'] = json.loads(data.get('configuration'))
+        return JsonResponse({'data': data})
+
+
 def task_index(request):
     """
     get all tasks
@@ -692,5 +740,49 @@ def task_index(request):
     """
     if request.method == 'GET':
         tasks = Task.objects.values()
-        print(tasks)
         return JsonResponse({'result': '1', 'data': tasks})
+
+
+def task_status(request, task_id):
+    """
+    get task status info
+    :param request: request object
+    :param task_id: task id
+    :return:
+    """
+    if request.method == 'GET':
+        result = []
+        task = Task.objects.get(id=task_id)
+        print('Task', task)
+        clients = clients_of_task(task)
+        for client in clients:
+            job_id = get_job_id(client, task)
+            job = DjangoJob.objects.get(name=job_id)
+            executions = serialize('json', DjangoJobExecution.objects.filter(job=job))
+            result.append({
+                'client': model_to_dict(client),
+                'next': job.next_run_time,
+                'executions': json.loads(executions)
+            })
+        return JsonResponse({'data': result, 'status': '1'})
+
+
+def render_html(request):
+    """
+    render html with url
+    :param request:
+    :return:
+    """
+    if request.method == 'GET':
+        url = request.GET.get('url')
+        url = unquote(base64.b64decode(url).decode('utf-8'))
+        print('Decoded', url)
+        js = request.GET.get('js', 0)
+        script = request.GET.get('script')
+        try:
+            response = requests.get(url, timeout=5)
+            response.encoding = response.apparent_encoding
+            html = process_html(response.text)
+            return HttpResponse(html)
+        except Exception as e:
+            return JsonResponse({'message': e.args}, status=500)
